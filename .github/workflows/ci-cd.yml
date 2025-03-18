@@ -1,0 +1,57 @@
+name: Build and Test Packages
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            build-essential \
+            git \
+            cmake \
+            curl \
+            wget \
+          && sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Upgrade pip and install Python build dependencies
+        run: |
+          pip install --upgrade pip cython
+
+      - name: Install TVM Unity (Prebuilt Package)
+        run: |
+          # For a CPU target, install the prebuilt TVM package.
+          pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly-cpu
+
+      - name: Build and install MLC-LLM
+        run: |
+          git clone --recursive https://github.com/mlc-ai/mlc-llm.git
+          cd mlc-llm
+          mkdir -p build && cd build
+          # Configure build with desired flags
+          cmake .. -DCMAKE_BUILD_TYPE=Release \
+                    -DUSE_CUDA=OFF \
+                    -DUSE_METAL=OFF \
+                    -DUSE_OPENCL=OFF \
+                    -DUSE_VULKAN=OFF \
+                    -DUSE_ROCM=OFF \
+                    -DUSE_OPENMP=ON
+          # Build using all available processors
+          cmake --build . --parallel $(nproc)
+          # Install the Python package
+          cd ../python && pip install -e .

@@ -1,0 +1,41 @@
+name: mlc-prebuilt
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  # Base Python
+  - python=3.11.8
+  - pip>=22.0.0
+
+  # Core ML Dependencies
+  - pytorch
+  - torchvision
+  - torchaudio
+  - numpy
+  - faiss-cpu=1.10.0
+  - pillow
+
+  # Web & API Dependencies
+  - pip:
+    # Web Framework
+    - fastapi~=0.115.8
+    - uvicorn~=0.34.0
+    - starlette~=0.45.3
+    - python-multipart>=0.0.6
+    - pydantic>=2.0.0
+    - python-dotenv~=1.0.1
+
+    # ML Ecosystem
+    - transformers>=4.0.0
+    - huggingface_hub~=0.24.6
+    - sentence-transformers~=3.4.1
+    - llama-cpp-python~=0.3.7
+
+    # Utilities
+    - jinja2~=3.1.6
+    - posthog~=3.14.1
+    - langdetect~=1.0.9
+
+    # MLC requirements
+    - mlc-python

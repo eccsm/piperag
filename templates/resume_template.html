@@ -1,0 +1,89 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+  <title>{{ name }}</title>
+  <style type="text/css">
+    body {
+      font-family: Tahoma, sans-serif;
+      font-size: 10pt;
+      color: black;
+      margin: 20pt 50pt;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 15pt;
+    }
+    .info {
+      font-size: 10pt;
+      line-height: 130%;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Visible Content in Body -->
+  <div class="header">
+    <div class="info">
+      {{ title }}<br/>
+      <a href="mailto:{{ contactEmail }}">{{ contactEmail }}</a> |
+      {{ location }} | {{ contactPhone }}
+    </div>
+  </div>
+
+    <!-- Professional Summary -->
+    <p style="text-align:justify; line-height:130%; margin-top:15px;">
+      {{ profileIntro }}
+    </p>
+
+    <!-- Work Experience -->
+    <div style="margin-top:15px;">
+      <p class="name" style="font-size:12pt; text-align:left;">Work Experience</p>
+      {% for exp in experiences %}
+        <p class="experience-header" style="margin-top:10px;">
+          <span class="experience-title">{{ exp.title }} – {{ exp.role }} | {{ exp.location }}</span>
+        </p>
+        <ul>
+          {% for point in exp.points %}
+          <li>{{ point }}</li>
+          {% endfor %}
+          {% if exp.notableProjects %}
+            {% for project in exp.notableProjects %}
+            <li class="notable-project">Notable Project: {{ project }}</li>
+            {% endfor %}
+          {% endif %}
+        </ul>
+      {% endfor %}
+    </div>
+
+    <!-- Core Skills -->
+    <div style="margin-top:15px;">
+      <p class="section-title">Core Skills</p>
+      <p><strong>Programming Languages:</strong> {{ skills.programmingLanguages }}</p>
+      <p><strong>Frameworks &amp; Libraries:</strong> {{ skills.frameworks }}</p>
+      <p><strong>Database Technologies:</strong> {{ skills.databases }}</p>
+      <p><strong>DevOps &amp; Cloud:</strong> {{ skills.devops }}</p>
+      <p><strong>Other Technologies:</strong> {{ skills.others }}</p>
+    </div>
+
+    <!-- Education -->
+    <div style="margin-top:15px;">
+      <p class="section-title">Education</p>
+      <p style="line-height:130%; margin-top:4pt; white-space: pre-wrap;">{{ educationSummary }}</p>
+    </div>
+
+    <!-- Languages -->
+    <div style="margin-top:10px;">
+      <p class="section-title">Languages</p>
+      <p>{{ languages }}</p>
+    </div>
+
+    <!-- Certificates -->
+    <div style="margin-top:10px;">
+      <p class="section-title">Certificates</p>
+      <p style="white-space: pre-wrap;">{{ certificates }}</p>
+    </div>
+
+  </body>
+</html>
