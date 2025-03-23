@@ -1,134 +1,152 @@
 # --------------------------------------------
-# Base Stage: Use Miniconda
+# Base Stage: Use a Miniconda image as the starting point
 # --------------------------------------------
 FROM continuumio/miniconda3:latest AS base
 WORKDIR /app
 
+# System-level optimizations for performance
+RUN echo "vm.swappiness=10" >> /etc/sysctl.conf && \
+    echo "vm.vfs_cache_pressure=50" >> /etc/sysctl.conf && \
+    echo "vm.dirty_background_ratio=5" >> /etc/sysctl.conf && \
+    echo "vm.dirty_ratio=10" >> /etc/sysctl.conf && \
+    # Install any needed system utilities
+    apt-get update && apt-get install -y --no-install-recommends \
+    procps \
+    htop \
+    && rm -rf /var/lib/apt/lists/*
+
 # --------------------------------------------
-# Builder Stage
+# Builder Stage: Create the conda environment and build any extras
 # --------------------------------------------
 FROM base AS builder
 
-# (1) Install mamba for faster dependency resolution
+# Install mamba for faster package management
 RUN conda install -y mamba -n base -c conda-forge
 
-# (2) Copy environment.yml and create conda env with cleanup
+# Copy the exported environment file into the image
 COPY environment.yml .
-RUN mamba env create -f environment.yml && \
-    conda clean -afy && \
-    find /opt/conda/ -follow -type f -name '*.a' -delete && \
-    find /opt/conda/ -follow -type f -name '*.js.map' -delete && \
-    find /opt/conda/ -name '*.pyc' -delete && \
-    find /opt/conda/ -name '__pycache__' -exec rm -rf {} +
 
-# (3) Switch to conda environment for next commands
-SHELL ["/bin/bash", "-c"]
+# Create the conda environment as defined in environment.yml.
+RUN mamba env create -f environment.yml && conda clean -afy
 
-# (4) Install minimal OS packages and TeX dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      gnupg curl apt-transport-https \
-      pandoc \
+# Switch to the conda environment "mlc-prebuilt" for subsequent commands
+SHELL ["conda", "run", "-n", "mlc-prebuilt", "/bin/bash", "-c"]
+
+# Install build dependencies needed for additional packages
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       git \
       cmake \
-      wget \
-      texlive-xetex \
-      texlive-fonts-recommended \
-      texlive-lang-english \
-      texlive-latex-extra \
-      lmodern && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+      curl \
+      wget && \
+    rm -rf /var/lib/apt/lists/*
 
-# (5) Use conda env shell (mlc-prebuilt) for next commands
-SHELL ["conda", "run", "-n", "mlc-prebuilt", "/bin/bash", "-c"]
+# Install Rust and set specific version
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y && \
+    . $HOME/.cargo/env && \
+    rustup default 1.70.0 && \
+    rustup show
 
-# (6) Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir faiss-cpu==1.10.0 && \
-    pip install --no-cache-dir \
-      huggingface_hub>=0.24.6 \
-      transformers>=4.30.0 \
-      datasets>=2.14.0 && \
-    pip cache purge
+# Add Rust to bashrc for later steps
+RUN echo 'source $HOME/.cargo/env' >> $HOME/.bashrc
 
-# (7) Install MLC-python and llama-cpp-python
-RUN pip install --no-cache-dir \
-    mlc-python \
-    mlc-ai-nightly-cpu \
-    llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu && \
-    pip cache purge
+# Rename conda's internal linker to avoid glibc conflicts
+# Only do this if absolutely necessary for your build
+RUN mv "$CONDA_PREFIX/compiler_compat/ld" "$CONDA_PREFIX/compiler_compat/ld_bak" || echo "Linker not found, skipping rename"
 
-# Create directories for models and data
-RUN mkdir -p /app/models /app/huggingface/cache /app/storage /app/llm/gguf
+# Install llama-cpp-python using the pre-built CPU wheel index
+RUN pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 
-# Copy the download script first for better layer caching
-COPY download_model.py .
+# Clone and build MLC-LLM with cargo/rustc environment loaded
+RUN . $HOME/.cargo/env && \
+    git clone --recursive https://github.com/mlc-ai/mlc-llm.git && \
+    cd mlc-llm && \
+    mkdir -p build && cd build && \
+    # Create config.cmake with build settings - optimize for CPU
+    echo 'set(CMAKE_BUILD_TYPE Release)' > ../cmake/config.cmake && \
+    echo 'set(USE_CUDA OFF)' >> ../cmake/config.cmake && \
+    echo 'set(USE_METAL OFF)' >> ../cmake/config.cmake && \
+    echo 'set(USE_OPENCL OFF)' >> ../cmake/config.cmake && \
+    echo 'set(USE_VULKAN OFF)' >> ../cmake/config.cmake && \
+    echo 'set(USE_ROCM OFF)' >> ../cmake/config.cmake && \
+    echo 'set(USE_OPENMP ON)' >> ../cmake/config.cmake && \
+    # Add optimization flags for Ryzen CPU
+    echo 'set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=znver2 -O3")' >> ../cmake/config.cmake && \
+    # Run cmake with settings (these will override any config.cmake settings)
+    cmake .. && \
+    # Build with parallel jobs - limit to 4 for memory constraints
+    cmake --build . --parallel 4
+
+# Install the MLC-LLM Python package in editable mode
+RUN cd mlc-llm/python && pip install -e .
+
+# Install TVM Unity (Prebuilt Package)
+RUN python -m pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly-cpu
+
+# Install additional performance packages
+RUN pip install uvloop httptools psutil
 
 # Copy the rest of your application code
+# Use the dot to copy all files in the current directory
 COPY . .
 
+# Upgrade torchvision for compatibility
+RUN pip install --upgrade torchvision
+
 # --------------------------------------------
-# Final Stage
+# Final Stage: Create a lightweight runtime image
 # --------------------------------------------
 FROM continuumio/miniconda3:latest AS final
 WORKDIR /app
 
-# (A) Install minimal runtime libs and TeX dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# System-level optimizations carried to final image
+RUN echo "vm.swappiness=10" >> /etc/sysctl.conf && \
+    echo "vm.vfs_cache_pressure=50" >> /etc/sysctl.conf && \
+    echo "vm.dirty_background_ratio=5" >> /etc/sysctl.conf && \
+    echo "vm.dirty_ratio=10" >> /etc/sysctl.conf
+
+# Install runtime libraries (e.g., for OpenCV or similar)
+RUN apt-get update && apt-get install -y --no-install-recommends \
       libgl1 \
       libglib2.0-0 \
-      pandoc \
-      texlive-xetex \
-      texlive-fonts-recommended \
-      texlive-lang-english \
-      lmodern && \
-    apt-get clean && \
+      procps && \
     rm -rf /var/lib/apt/lists/*
 
-# (B) Create minimal runtime conda environment
-RUN conda create -n mlc-runtime python=3.11 -y && \
-    conda clean -afy && \
-    find /opt/conda/ -follow -type f -name '*.a' -delete && \
-    find /opt/conda/ -follow -type f -name '*.js.map' -delete && \
-    find /opt/conda/ -name '*.pyc' -delete
+# Copy the conda environment from the builder stage
+COPY --from=builder /opt/conda/envs/mlc-prebuilt /opt/conda/envs/mlc-prebuilt
 
-# (C) Copy only the necessary Python packages from builder
-COPY --from=builder /opt/conda/envs/mlc-prebuilt/lib/python3.11/site-packages /opt/conda/envs/mlc-runtime/lib/python3.11/site-packages
+# Set the PATH so that the conda environment is used by default
+ENV PATH=/opt/conda/envs/mlc-prebuilt/bin:$PATH
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
-# (D) Copy application files
-COPY --from=builder /app/download_model.py /app/
-COPY --from=builder /app/main.py /app/
-COPY --from=builder /app/config.py /app/
-COPY --from=builder /app/vector_store.py /app/
-COPY --from=builder /app/data_loader.py /app/
-COPY --from=builder /app/embedding_utils.py /app/
-COPY --from=builder /app/llm_utils.py /app/
-COPY --from=builder /app/services /app/services
-COPY --from=builder /app/templates /app/templates
-COPY --from=builder /app/image /app/image
-COPY --from=builder /app/*.pt /app/
-COPY --from=builder /app/train /app/train
+# Set performance environment variables
+ENV MLC_NUM_THREADS=4 \
+    TVM_NUM_THREADS=4 \
+    MLC_USE_CUDA=0 \
+    MALLOC_TRIM_THRESHOLD_=65536
 
-# Copy Docker-specific .env file
-COPY .env.docker /app/.env
+# Copy all application files from the builder stage
+COPY --from=builder /app /app
 
-# (E) Create directories for models and data
-RUN mkdir -p /app/models /app/huggingface/cache /app/storage /app/llm/gguf
+# Create startup script with optimized uvicorn settings
+RUN echo '#!/bin/bash\n\
+uvicorn main:app \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --workers 2 \
+  --limit-concurrency 50 \
+  --backlog 2048 \
+  --timeout-keep-alive 5 \
+  --log-level warning \
+  --http httptools \
+  --loop uvloop \
+  --no-access-log\
+' > /app/start.sh && chmod +x /app/start.sh
 
-# (F) Set up environment variables
-ENV PATH=/opt/conda/envs/mlc-runtime/bin:$PATH \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    MLC_MODEL_DIR="/app/models" \
-    HF_HOME="/app/huggingface" \
-    HF_CACHE_DIR="/app/huggingface/cache"
-
-# (G) Add entrypoint script to handle model downloads at startup
-ENTRYPOINT ["python", "download_model.py"]
-
+# Expose the port your app listens on
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Set the default command to run your application with optimized settings
+CMD ["/app/start.sh"]

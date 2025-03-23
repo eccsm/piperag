@@ -1,10 +1,23 @@
-import os
 import json
-from typing import Dict, Any, Optional
+import os
+from typing import Dict, Any
+
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+
+def _load_json_env(env_name: str, default: Any = None) -> Any:
+    """Load JSON from environment variable"""
+    env_value = os.getenv(env_name)
+    if not env_value:
+        return default
+    try:
+        return json.loads(env_value)
+    except json.JSONDecodeError:
+        print(f"Warning: Could not parse JSON from {env_name}")
+        return default
 
 
 class Config:
@@ -33,9 +46,9 @@ class Config:
         self.MODEL_TYPE = os.getenv('MODEL_TYPE', 'gguf')
 
         # Model mappings
-        self._mlc_model_map = self._load_json_env('MLC_MODEL_MAP', {"default": "eccsm/mlc_llm"})
-        self._gguf_model_map = self._load_json_env('GGUF_MODEL_MAP', {"default": "gguf-vicuna-7b-v1.5-q4_1.gguf"})
-        self.IMAGE_MODEL_MAP = self._load_json_env('IMAGE_MODEL_MAP', {})
+        self._mlc_model_map = _load_json_env('MLC_MODEL_MAP', {"default": "eccsm/mlc_llm"})
+        self._gguf_model_map = _load_json_env('GGUF_MODEL_MAP', {"default": "gguf-vicuna-7b-v1.5-q4_1.gguf"})
+        self.IMAGE_MODEL_MAP = _load_json_env('IMAGE_MODEL_MAP', {})
 
         # Default active models
         self._default_mlc_model = os.getenv('DEFAULT_MLC_MODEL', 'default')
@@ -51,17 +64,6 @@ class Config:
 
         # Embedding Model
         self.EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL')
-
-    def _load_json_env(self, env_name: str, default: Any = None) -> Any:
-        """Load JSON from environment variable"""
-        env_value = os.getenv(env_name)
-        if not env_value:
-            return default
-        try:
-            return json.loads(env_value)
-        except json.JSONDecodeError:
-            print(f"Warning: Could not parse JSON from {env_name}")
-            return default
 
     @property
     def MLC_MODEL(self) -> str:

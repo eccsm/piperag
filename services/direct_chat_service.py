@@ -1,94 +1,173 @@
 import logging
-import sys
 import os
-import re
-from pathlib import Path
-from typing import Iterator, List, Dict, Any, Optional, Union
+import sys
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
-from posthog import flush
-from huggingface_hub import snapshot_download, hf_hub_download
-
-# Add the mlc-llm directory to the Python path
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'mlc-llm'))
 from mlc_llm import MLCEngine
 
-from services.chat_service import ChatService  # Your abstract chat service interface
+from services.chat_service import ChatService
 from config import Config
 
 logger = logging.getLogger("mlc_llm_integration")
 logger.setLevel(logging.DEBUG)
-stop_tokens = ["User:"]
+
+# Efficient stop tokens
+STOP_TOKENS = ["User:", "< EOT >", "Human:", "Assistant:"]
+
+# Global model cache to avoid reloading
+_MODEL_CACHE = {}
+_MODEL_LOCK = threading.RLock()
 
 
-def _process_model_path(model_path: str) -> str:
-    """
-    Process the model path, downloading from HuggingFace if necessary.
+class MLCModelManager:
+    @staticmethod
+    def get_model(model_path):
+        with _MODEL_LOCK:
+            if model_path not in _MODEL_CACHE:
+                logger.info(f"Loading MLC model: {model_path}")
+                _MODEL_CACHE[model_path] = MLCEngine(model_path)
+                # Perform warmup in background
+                threading.Thread(
+                    target=MLCModelManager._warmup_model,
+                    args=(_MODEL_CACHE[model_path],),
+                    daemon=True
+                ).start()
+            return _MODEL_CACHE[model_path]
 
-    Supports the following formats:
-    - Local path: '/app/models/model_name'
-    - HF URL format: 'HF://username/repo_name'
+    @staticmethod
+    def _warmup_model(engine):
+        try:
+            warmup_msg = [{"role": "user", "content": "Hello"}]
+            engine.chat.completions.create(
+                messages=warmup_msg,
+                stream=False,
+                max_tokens=20
+            )
+            logger.info("Model warmup complete")
+        except Exception as e:
+            logger.warning(f"Model warmup had an issue: {e}")
 
-    Returns the local path to the model.
-    """
-    # Check if it's a HuggingFace URL
-    hf_pattern = r"^HF://([^/]+)/([^/]+)$"
-    match = re.match(hf_pattern, model_path)
 
-    if not match:
-        # It's a local path, return as is
-        logger.info(f"Using local model at: {model_path}")
-        return model_path
+# Optimized batch accumulator
+class TokenBatchAccumulator:
+    def __init__(self, batch_size=10, batch_timeout=0.05):
+        self.batch_size = batch_size
+        self.batch_timeout = batch_timeout
+        self.tokens = []
+        self.last_flush_time = time.time()
 
-    # Extract username and repo name from the HF URL
-    username, repo_name = match.groups()
-    repo_id = f"{username}/{repo_name}"
+    def add(self, token):
+        self.tokens.append(token)
+        current_time = time.time()
+        if len(self.tokens) >= self.batch_size or (current_time - self.last_flush_time) >= self.batch_timeout:
+            return self.flush()
+        return None
 
-    # Define the local directory where the model will be saved
-    models_dir = os.environ.get("MLC_MODEL_DIR", "/app/models")
-    local_model_dir = os.path.join(models_dir, repo_name)
-
-    # Check if model already exists locally
-    if os.path.exists(local_model_dir) and os.listdir(local_model_dir):
-        logger.info(f"Model already downloaded at: {local_model_dir}")
-        return local_model_dir
-
-    # Ensure the models directory exists
-    os.makedirs(models_dir, exist_ok=True)
-
-    # Download the model from HuggingFace
-    logger.info(f"Downloading model from HuggingFace: {repo_id} to {local_model_dir}")
-    try:
-        snapshot_download(
-            repo_id=repo_id,
-            local_dir=local_model_dir,
-            local_dir_use_symlinks=False,  # Avoid symlinks for Docker compatibility
-            resume_download=True
-        )
-        logger.info(f"Model downloaded successfully to: {local_model_dir}")
-        return local_model_dir
-    except Exception as e:
-        logger.error(f"Error downloading model from HuggingFace: {e}", exc_info=True)
-        raise RuntimeError(f"Failed to download model from {repo_id}: {str(e)}")
+    def flush(self):
+        if not self.tokens:
+            return None
+        result = "".join(self.tokens)
+        self.tokens = []
+        self.last_flush_time = time.time()
+        return result
 
 
 class DirectChatService(ChatService):
     def __init__(self, config: Config):
         super().__init__(config)
-        # Process the model path - could be local or HF URL
-        model_path = _process_model_path(config.MLC_MODEL)
-        logger.info(f"Initializing MLCEngine with model path: {model_path}")
-        self.llm = MLCEngine(model_path)
+        # Use the model manager to get a cached instance
+        self.llm = MLCModelManager.get_model(self.config.MLC_MODEL)
+        self.executor = ThreadPoolExecutor(max_workers=2)
 
     def generate_response(self, query: str, **kwargs) -> str:
         full_response = ""
         messages = [{"role": "user", "content": query}]
+
         try:
-            for response in self.llm.chat.completions.create(messages=messages, stream=True):
+            # Optimize generation parameters
+            params = {
+                "messages": messages,
+                "stream": True,
+                "max_tokens": kwargs.get("max_tokens", 1024),
+                "temperature": kwargs.get("temperature", 0.1),  # Lower temperature for faster generation
+                "top_p": kwargs.get("top_p", 0.8),  # Add top_p for faster sampling
+                "stop": STOP_TOKENS
+            }
+
+            # Create a batch accumulator with larger batch size
+            accumulator = TokenBatchAccumulator(batch_size=15, batch_timeout=0.03)
+
+            # Use executor for background processing of responses
+            def process_chunk(response):
+                nonlocal full_response
+                batch_content = accumulator.add(response)
+                if batch_content:
+                    full_response += batch_content
+                    return batch_content
+                return None
+
+            # Stream responses with optimized batching
+            for response in self.llm.chat.completions.create(**params):
                 for choice in response.choices:
-                    content = choice.delta.content.rstrip()
-                    full_response += content
-                    logger.debug(f"MLC response chunk: {content}")
+                    content = choice.delta.content
+                    if content:
+                        # Process in background to reduce main thread blocking
+                        future = self.executor.submit(process_chunk, content)
+                        batch = future.result()
+                        if batch:
+                            logger.debug(f"MLC response batch: {batch}")
+
+            # Flush any remaining tokens
+            remaining = accumulator.flush()
+            if remaining:
+                full_response += remaining
+                logger.debug(f"MLC final response batch: {remaining}")
+
             return full_response
+
         except Exception as e:
             logger.error("Error in MLC call", exc_info=True)
             raise e
+
+    def generate_response_stream(self, query: str, **kwargs):
+        """
+        Generator function that yields tokens one by one for streaming responses.
+        This is used by the streaming endpoint.
+        """
+        messages = [{"role": "user", "content": query}]
+
+        try:
+            # Optimize generation parameters for streaming
+            params = {
+                "messages": messages,
+                "stream": True,
+                "max_tokens": kwargs.get("max_tokens", 1024),
+                "temperature": kwargs.get("temperature", 0.1),
+                "top_p": kwargs.get("top_p", 0.8),
+                "stop": STOP_TOKENS
+            }
+
+            # Small batch accumulator for smoother streaming
+            accumulator = TokenBatchAccumulator(batch_size=5, batch_timeout=0.02)
+
+            # Stream responses token by token with minimal batching
+            for response in self.llm.chat.completions.create(**params):
+                for choice in response.choices:
+                    content = choice.delta.content
+                    if content:
+                        # Add to accumulator
+                        batch = accumulator.add(content)
+                        if batch:
+                            yield batch
+
+            # Flush any remaining tokens
+            remaining = accumulator.flush()
+            if remaining:
+                yield remaining
+
+        except Exception as e:
+            logger.error("Error in MLC streaming call", exc_info=True)
+            yield f"Error: {str(e)}"

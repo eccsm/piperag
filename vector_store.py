@@ -1,9 +1,10 @@
-import os
 import json
+import logging
+import os
+from typing import List, Dict, Any
+
 import faiss
 import numpy as np
-import logging
-from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
